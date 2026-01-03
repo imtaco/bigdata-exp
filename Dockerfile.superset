@@ -1,0 +1,101 @@
+# ==============================================================================
+# Multi-Stage Build for Superset with Auto-Generated Constraints
+# ==============================================================================
+# orignal apache/5.0.0 is too large and wasted (unnecessary .cache)
+# generate constraints.txt for python pkg align to apache/superset:5.0.0
+# install pkg for PostgreSQL, BigQUery and Trino
+
+# ==============================================================================
+# Stage 1: Generate and merge constraints
+# ==============================================================================
+FROM apache/superset:5.0.0 AS constraints-generator
+
+USER root
+
+# Extract all installed packages as base constraints
+RUN uv pip list --format=freeze | grep -v '@' > /tmp/base-constraints.txt
+
+# Copy custom post-constraints from local
+COPY post-constraints.txt /tmp/post-constraints.txt
+
+# Merge constraints using the same logic as build-docker.sh
+RUN bash <<'EOF'
+cat /tmp/base-constraints.txt /tmp/post-constraints.txt \
+| awk '
+function pkgname(line) {
+  if (match(line, /^[A-Za-z0-9._-]+/)) {
+    return substr(line, RSTART, RLENGTH)
+  }
+  return line
+}
+NF == 0 { next }
+{
+  pkg = pkgname($0);
+  table[pkg] = $0;
+  order[pkg] = NR
+}
+END {
+  for (p in table) print table[p]
+}' \
+| sort > /tmp/constraints.txt
+EOF
+
+# ==============================================================================
+# Stage 2: Builder - Install all dependencies
+# ==============================================================================
+FROM python:3.10-slim AS builder
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libpq-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and constraints
+COPY requirements.txt /tmp/requirements.txt
+COPY --from=constraints-generator /tmp/constraints.txt /tmp/constraints.txt
+
+# Install all Python packages with constraints
+RUN pip install --no-cache-dir \
+    -r /tmp/requirements.txt \
+    -c /tmp/constraints.txt
+
+
+# ==============================================================================
+# Stage 3: Final runtime image
+# ==============================================================================
+FROM python:3.10-slim
+
+# the same ENV from apache/superset:5.0.0
+ENV SUPERSET_HOME="/app/superset_home" \
+    SUPERSET_ENV="production" \
+    SUPERSET_PORT="8088" \
+    HOME="/app/superset_home" \
+    FLASK_APP="superset.app:create_app()" \
+    PYTHONPATH="/app/pythonpath" \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Copy installed packages from builder
+COPY --from=builder /usr/local/ /usr/local/
+# Copy run-server.sh from official Superset image
+COPY --from=constraints-generator /usr/bin/run-server.sh /usr/bin/run-server.sh
+
+# Install runtime dependencies and setup in one layer
+RUN apt-get update && apt-get install -y \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p ${SUPERSET_HOME} \
+    && rm -rf /root/.cache ~/.cache /tmp/* \
+    && useradd superset \
+    && chown -R superset:superset ${SUPERSET_HOME}
+
+USER superset
+
+EXPOSE 8088
+
+CMD ["/usr/bin/run-server.sh"]
